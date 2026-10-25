@@ -1,5 +1,7 @@
 // BDGS Launcher - downloads the BDGS custom maps from the fastdl (Cloudflare R2 via Worker),
 // Download only - it does not start the game. Target: .NET Framework 4.x (built into Windows 10/11).
+// 1.1 (2026-10-25): the map list comes from the fastdl itself (maps.txt), so every map that is on the
+//      fastdl is downloaded without a new launcher; a file is downloaded again when the fastdl has a newer one.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -13,14 +15,15 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("BDGS Launcher")]
 [assembly: AssemblyDescription("Downloads BDGS [SAB] custom maps")]
 [assembly: AssemblyCompany("BDGS")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 static class Launcher
 {
     const string BaseUrl = "https://iw4x-fastdl.ahmed-shahjada.workers.dev/";
 
-    static readonly string[] Maps = {
+    // Used only if the fastdl's map list (maps.txt) can't be read.
+    static readonly string[] BuiltInMaps = {
             "mp_afghan", "mp_derail", "mp_estate", "mp_favela", "mp_highrise", "mp_invasion",
             "mp_checkpoint", "mp_quarry", "mp_rundown", "mp_rust", "mp_boneyard", "mp_nightshift",
             "mp_subbase", "mp_terminal", "mp_underpass", "mp_brecourt", "mp_crash", "mp_overgrown",
@@ -34,11 +37,13 @@ static class Launcher
             "co_hunted", "mp_aground_ss", "mp_bootleg", "mp_burn_ss", "mp_carbon", "mp_cement",
             "mp_courtyard_ss", "mp_csgo_monastery", "mp_hillside_ss", "mp_interchange", "mp_italy", "mp_lambeth",
             "mp_meteora", "mp_moab", "mp_mogadishu", "mp_nola", "mp_overwatch", "mp_qadeem",
-            "mp_rasalem", "mp_roughneck", "mp_shipbreaker"
+            "mp_rasalem", "mp_roughneck", "mp_shipbreaker", "mp_creek",
+            "mp_six_ss", "mp_radar", "mp_morningwood", "mp_boardwalk", "mp_crosswalk_ss", "mp_restrepo_ss",
+            "mp_park", "mp_exchange"
     };
     static readonly string[] FilePatterns = { "{0}.ff", "{0}_load.ff", "{0}.iwd", "{0}.arena" };
 
-    class Item { public string Map, Name, Url, Dest; public long Size; }
+    class Item { public string Map, Name, Url, Dest; public long Size; public DateTime Changed; }
 
     static long doneBytes, totalBytes, movedBytes;
     static readonly Stopwatch clock = new Stopwatch();
@@ -83,6 +88,7 @@ static class Launcher
 
         // ---- 1. check
         Console.WriteLine();
+        string[] Maps = LoadMapList(baseUrl);
         Say("Checking " + Maps.Length + " maps against the BDGS server...");
         var todo = new List<Item>();
         int custom = 0;
@@ -98,12 +104,14 @@ static class Launcher
                 {
                     string name = string.Format(pat, map);
                     string rel = "usermaps/" + map + "/" + name;
-                    long size = RemoteSize(baseUrl + rel);
+                    DateTime changed;
+                    long size = RemoteSize(baseUrl + rel, out changed);
                     if (size < 0) { if (first) break; continue; }   // no .ff = built-in map
                     if (first) { custom++; first = false; }
                     string dest = Path.Combine(Path.Combine(usermaps, map), name);
-                    if (File.Exists(dest) && new FileInfo(dest).Length == size) continue;
-                    todo.Add(new Item { Map = map, Name = name, Url = baseUrl + rel, Dest = dest, Size = size });
+                    if (File.Exists(dest) && new FileInfo(dest).Length == size &&
+                        (changed == DateTime.MinValue || File.GetLastWriteTimeUtc(dest) >= changed.AddSeconds(-2))) continue;
+                    todo.Add(new Item { Map = map, Name = name, Url = baseUrl + rel, Dest = dest, Size = size, Changed = changed });
                     mapsTodo.Add(map);
                 }
             }
@@ -201,21 +209,53 @@ static class Launcher
     {
         var r = (HttpWebRequest)WebRequest.Create(url);
         r.Method = method;
-        r.UserAgent = "BDGS-Launcher/1.0";
+        r.UserAgent = "BDGS-Launcher/1.1";
         r.Timeout = 30000;
         r.ReadWriteTimeout = 60000;
         r.AllowAutoRedirect = true;
         return r;
     }
 
-    static long RemoteSize(string url)
+    // Every map on the fastdl, read from its map list; the built-in list if that can't be read.
+    static string[] LoadMapList(string baseUrl)
     {
+        try
+        {
+            var req = NewRequest(baseUrl + "maps.txt", "GET");
+            req.Timeout = 20000;
+            string text;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var rd = new StreamReader(resp.GetResponseStream()))
+                text = rd.ReadToEnd();
+            var list = new List<string>();
+            foreach (string line in text.Split('\n'))
+            {
+                string n = line.Trim();
+                if (n.Length > 0 && n.Length < 64 && System.Text.RegularExpressions.Regex.IsMatch(n, "^[A-Za-z0-9_]+$") && !list.Contains(n)) list.Add(n);
+            }
+            if (list.Count > 0) return list.ToArray();
+        }
+        catch { }
+        return BuiltInMaps;
+    }
+
+    // File size on the fastdl (-1 = not there) and when it was put there (MinValue = unknown).
+    static long RemoteSize(string url, out DateTime changed)
+    {
+        changed = DateTime.MinValue;
         for (int attempt = 1; ; attempt++)
         {
             try
             {
                 using (var resp = (HttpWebResponse)NewRequest(url, "HEAD").GetResponse())
+                {
+                    string lm = resp.Headers["Last-Modified"];
+                    DateTime t;
+                    if (lm != null && DateTime.TryParse(lm, System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out t))
+                        changed = t;
                     return resp.ContentLength;
+                }
             }
             catch (WebException e)
             {
@@ -266,6 +306,7 @@ static class Launcher
                 if (len != f.Size) throw new IOException("incomplete download (" + len + " of " + f.Size + " bytes)");
                 if (File.Exists(f.Dest)) File.Delete(f.Dest);
                 File.Move(part, f.Dest);
+                if (f.Changed != DateTime.MinValue) { try { File.SetLastWriteTimeUtc(f.Dest, f.Changed); } catch { } }
                 return;
             }
             catch (Exception e)
